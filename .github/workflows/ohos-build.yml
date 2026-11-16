@@ -221,7 +221,19 @@ jobs:
         run: |
           set -euo pipefail
           cd "$DSH_DL"
-          curl -fL --retry 3 --retry-delay 10 --retry-all-errors -o ohos-sdk.tar.gz "$SDK_TAR_URL"
+          # 3.2 GB over a public mirror: a stalled socket must not hang the job
+          # for its whole timeout, and a resumed file is cheaper than restarting.
+          target=3384355680
+          for attempt in 1 2 3 4 5 6; do
+            have="$(stat -c%s ohos-sdk.tar.gz 2>/dev/null || echo 0)"
+            if [ "$have" = "$target" ]; then echo "SDK tarball already complete ($have bytes)"; break; fi
+            echo "SDK download attempt $attempt (have $have of $target bytes)"
+            curl -fL --retry 2 --retry-delay 5 --retry-all-errors -C - \
+              --connect-timeout 30 --speed-limit 500000 --speed-time 90 --max-time 1500 \
+              -o ohos-sdk.tar.gz "$SDK_TAR_URL" || true
+          done
+          have="$(stat -c%s ohos-sdk.tar.gz 2>/dev/null || echo 0)"
+          if [ "$have" != "$target" ]; then echo "::error::SDK tarball is $have bytes, expected $target"; exit 1; fi
           ls -l ohos-sdk.tar.gz
           # The tarball is ~3.2 GB and holds one nested zip per component under
           # ohos-sdk/linux/; only those members are extracted (host leftovers
@@ -347,9 +359,22 @@ jobs:
           set -euo pipefail
           # --clang must be the clang++ the cxx runtime was built with; the flock
           # addon is compiled with the SDK's own clang by build-hap-libs.py.
+          #
+          # build-loader.py does `args.compiler.resolve()`, and `Path.resolve()`
+          # dereferences symlinks: the LLVM release ships clang++ as a link to
+          # clang-23, so argv[0] became clang-23, clang ran in C driver mode, and
+          # nothing added -lc++/-lc++abi (every C++ runtime symbol ended up
+          # undefined). A real copy that is actually named clang++ keeps the C++
+          # driver, and its bytes still match runtimes.json's compilerSha256.
+          mkdir -p "$DSH_BASE/toolbin"
+          cp -f "$(readlink -f "$DSH_LLVM_BIN/clang++")" "$DSH_BASE/toolbin/clang++"
+          chmod +x "$DSH_BASE/toolbin/clang++"
+          test ! -L "$DSH_BASE/toolbin/clang++"
+          ls -l "$DSH_BASE/toolbin"
+          "$DSH_BASE/toolbin/clang++" -dM -E -x c++ /dev/null | grep -E '^#define __cplusplus'
           python3 runtime/ohos/native/build-hap-libs.py \
             --sdk-native "$DSH_SDK_NATIVE" \
-            --clang "$DSH_LLVM_BIN/clang++" \
+            --clang "$DSH_BASE/toolbin/clang++" \
             --cxx-runtime "$DSH_BASE/runtimes" \
             --libnode-output "$DSH_BASE/libnode" \
             --node-source "$DSH_NODE_SRC" \
