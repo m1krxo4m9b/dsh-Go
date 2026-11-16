@@ -179,6 +179,9 @@ jobs:
           test -f "$DSH_BASE/libnode/build.json"
           test -f "$DSH_BASE/runtimes/runtimes.json"
           test -d "$DSH_BASE/runtimes/include/c++/v1"
+          # build-hap-libs.py refuses a pre-existing --output, and the artifact
+          # carries the previous run's native/arm64-v8a partial set.
+          rm -rf "$DSH_BASE/native"
           du -sh "$DSH_BASE/libnode" "$DSH_BASE/runtimes"
           echo 'DSH_RESTORED=1' >> "$GITHUB_ENV"
 
