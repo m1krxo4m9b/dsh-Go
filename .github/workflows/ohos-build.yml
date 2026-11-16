@@ -16,8 +16,12 @@ on:
       bundleName:
         description: bundleName written into app/ohos/AppScope/app.json5 and into the HAP
         required: true
-        default: ccchimneyyy.dsh.go
+        default: com.dshgo.app
         type: string
+  # Lets the CI be fired with a repository token that only carries Contents:write
+  # (the workflow_dispatch endpoint needs Actions:write, which such a token lacks).
+  repository_dispatch:
+    types: [ohos-build]
 
 permissions:
   contents: read
@@ -430,7 +434,9 @@ jobs:
           # app/ohos/AppScope/app.json5 is the only place the bundleName lives;
           # check-arkts.sh copies app/ohos into a scratch tree, so the override has
           # to happen in the checked-out tree before it runs.
-          bundle="${{ inputs.bundleName }}"
+          bundle="${{ github.event.client_payload.bundleName }}"
+          if [ -z "$bundle" ]; then bundle="${{ inputs.bundleName }}"; fi
+          if [ -z "$bundle" ]; then bundle="com.dshgo.app"; fi
           if ! printf '%s' "$bundle" | grep -Eq '^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$'; then
             echo "::error::bundleName '$bundle' is not a dotted identifier"
             exit 1
