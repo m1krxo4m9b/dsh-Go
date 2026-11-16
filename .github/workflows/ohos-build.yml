@@ -42,6 +42,10 @@ env:
   LOADER_TAR_SHA256: '286616f15e4f12013988e45ad27a69b4968a9f059c8bd351e412505230577948'
   SQLITE_ZIP_SHA256: '0a9c8e34352dad46006aa82836d5383bff9dc6bc9ce5a60553c05aa30e6ad1f9'
   SQLITE3_PKG_SHA256: '8765980411f9b6733534efe9d014fad0750fa649590598772c04692deb34886b'
+  # Set to the id of a dsh-ohos-native artifact that already holds libnode/ and
+  # runtimes/ to skip the two expensive stages (about two hours). Empty builds
+  # everything from source.
+  RESTORE_ARTIFACT: '14204099887'
 
 jobs:
   ohos:
@@ -161,6 +165,23 @@ jobs:
           test -f "$DSH_BASE/node-src/src/node_api.h"
           ls -l llvm-src.tar.xz node-src.tar.xz
 
+      - name: Restore the reusable native inputs when requested
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RESTORE_ARTIFACT:-}" ]; then echo 'RESTORE_ARTIFACT is empty, building everything from source'; exit 0; fi
+          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
+            -o "$DSH_DL/native-keep.zip" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${RESTORE_ARTIFACT}/zip"
+          unzip -q -o "$DSH_DL/native-keep.zip" -d "$DSH_BASE"
+          test -f "$DSH_BASE/libnode/libnode.so"
+          test -f "$DSH_BASE/libnode/build.json"
+          test -f "$DSH_BASE/runtimes/runtimes.json"
+          test -d "$DSH_BASE/runtimes/include/c++/v1"
+          du -sh "$DSH_BASE/libnode" "$DSH_BASE/runtimes"
+          echo 'DSH_RESTORED=1' >> "$GITHUB_ENV"
+
       - name: Download the host Node ${{ env.NODE_VERSION }}
         run: |
           set -euo pipefail
@@ -261,6 +282,7 @@ jobs:
         run: npm ci --ignore-scripts --no-audit --no-fund --prefix runtime/ohos/node/build-tools
 
       - name: Build libc++ / libc++abi / libunwind for aarch64-linux-ohos
+        if: env.DSH_RESTORED != '1'
         run: |
           set -euo pipefail
           python3 runtime/ohos/node/build-runtimes.py \
@@ -273,6 +295,7 @@ jobs:
           ls -l "$DSH_BASE/runtimes" "$DSH_BASE/runtimes/lib"
 
       - name: Cross-compile libnode.so
+        if: env.DSH_RESTORED != '1'
         run: |
           set -euo pipefail
           python3 runtime/ohos/node/build-node.py \
@@ -347,7 +370,7 @@ jobs:
           [ -d "$base/native" ] && cp -a "$base/native/." keep/native/ || true
           [ -d "$base/libnode" ] && cp -a "$base/libnode/." keep/libnode/ || true
           [ -d "$base/runtimes" ] && cp -a "$base/runtimes/." keep/runtimes/ || true
-          ls -lR keep | head -n 40
+          ls -lR keep | head -n 40 || true
 
       - name: Upload the native libraries
         if: always()
@@ -467,9 +490,18 @@ jobs:
       - name: Show the build log tail on failure
         if: failure()
         run: |
+          set +e
           for f in "$DSH_BASE/arkts/hvigor.log" "$DSH_BASE/arkts/diagnostics.txt"; do
             if [ -f "$f" ]; then echo "===== $f ====="; tail -n 80 "$f"; fi
           done
+          # build-hap-libs.py sends each compiler invocation to <work>/*/compile.log
+          # and the Actions log keeps only the traceback, so dump them here.
+          while IFS= read -r f; do
+            echo "===== $f ====="
+            tail -n 120 "$f"
+          done < <(find "$DSH_BASE/work-hap-libs" "$DSH_BASE/libnode" -name '*.log' -type f 2>/dev/null)
+          if [ -f "$DSH_BASE/native/audit.json" ]; then echo "===== native audit ====="; cat "$DSH_BASE/native/audit.json"; fi
+          ls -l "$DSH_BASE/native/arm64-v8a" 2>/dev/null
 
       - name: Collect the deliverables
         if: always()
