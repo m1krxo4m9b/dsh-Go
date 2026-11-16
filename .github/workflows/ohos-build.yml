@@ -1,0 +1,517 @@
+name: OHOS native libraries and unsigned HAP
+
+# Builds the five HAP native libraries (libnode.so, libdsh_host.so,
+# libdsh_flock.so, libdsh_require_builtin.so, libc++_shared.so) plus the
+# sqlite native asset for arm64-v8a (OHOS), composes the dsh runtime rawfile
+# zip, and packages an UNSIGNED HAP with tooling/ohos/check-arkts.sh --full.
+#
+# Every command line below is derived from the scripts' argparse definitions in
+# this repository (runtime/ohos/node/build-runtimes.py, build-node.py,
+# runtime/ohos/native/build-hap-libs.py, runtime/ohos/package/prepare-inputs.py,
+# compose-runtime.py, tooling/ohos/check-arkts.sh), not from --help output.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bundleName:
+        description: bundleName written into app/ohos/AppScope/app.json5 and into the HAP
+        required: true
+        default: ccchimneyyy.dsh.go
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  NODE_VERSION: '24.22.1'
+  # sha256 pins below: the first two are the ones the build scripts enforce,
+  # the rest are measured from the exact archive the scripts' own pins expect.
+  NODE_SOURCE_SHA256: '4f5379796280cdaeb0c2f358fd04b6a16cc4fb7dfa83b5a8c91a9d963b435231'
+  NODE_HOST_SHA256: '6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6'
+  LLVM_VERSION: '23.1.1'
+  LLVM_SOURCE_SHA256: 'ebe9be46fe8756d58c5b198ffad0fa2a766257add81a4dc52179bfacc7888ee6'
+  NPM_VERSION: '11.9.0'
+  SDK_TAR_URL: 'https://repo.huaweicloud.com/openharmony/os/7.0-Release/ohos-sdk-windows_linux-public.tar.gz'
+  FLOCK_TGZ_SHA256: '347a0bb0cb1ea1af6eb88f2b72eb3ee41cc7703093971e6b2a58fee19191c36e'
+  NODE_ADDON_API_TGZ_SHA256: '4cd65698541b19a33f798f1dc25c02c6ed1c9d7749b8824b1a1ccecdd197c8ea'
+  LOADER_TAR_SHA256: '286616f15e4f12013988e45ad27a69b4968a9f059c8bd351e412505230577948'
+  SQLITE_ZIP_SHA256: '0a9c8e34352dad46006aa82836d5383bff9dc6bc9ce5a60553c05aa30e6ad1f9'
+  SQLITE3_PKG_SHA256: '8765980411f9b6733534efe9d014fad0750fa649590598772c04692deb34886b'
+
+jobs:
+  ohos:
+    name: arm64-v8a native libraries and unsigned HAP
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the host build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build python3 python3-venv gcc g++ make \
+            patch xz-utils unzip zip file jq curl ca-certificates git
+          # check-arkts.sh needs `java` on PATH; the runner image ships Temurin
+          # with JAVA_HOME preset, this is only a fallback.
+          if [ -z "${JAVA_HOME:-}" ] || [ ! -x "${JAVA_HOME}/bin/java" ]; then
+            sudo apt-get install -y --no-install-recommends openjdk-17-jdk-headless
+            echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> "$GITHUB_ENV"
+          fi
+
+      - name: Choose the build root and report the toolchain
+        run: |
+          set -euo pipefail
+          # The root filesystem of a hosted runner is ~14 GB; everything large
+          # goes to /mnt when it is writable, with $RUNNER_TEMP as the fallback.
+          BASE=""
+          for candidate in /mnt/dsh-build "$RUNNER_TEMP/dsh-build"; do
+            if mkdir -p "$candidate" 2>/dev/null && [ -w "$candidate" ]; then
+              BASE="$candidate"
+              break
+            fi
+          done
+          if [ -z "$BASE" ]; then echo '::error::no writable build root'; exit 1; fi
+          rm -rf "$BASE"
+          mkdir -p "$BASE/dl" "$BASE/llvm" "$BASE/llvm-pkg" "$BASE/host-node" \
+                   "$BASE/node-src" "$BASE/sdk-raw" "$BASE/third" "$BASE/npm" \
+                   "$BASE/npm-cache" "$BASE/composition"
+          jobs="$(nproc)"
+          if [ "$jobs" -gt 4 ]; then jobs=4; fi
+          {
+            echo "DSH_BASE=$BASE"
+            echo "DSH_DL=$BASE/dl"
+            echo "DSH_JOBS=$jobs"
+          } >> "$GITHUB_ENV"
+          echo "base=$BASE jobs=$jobs"
+          df -h "$BASE" /
+          free -m | head -n 2
+          python3 --version
+          cmake --version | head -n 1
+          ninja --version
+          gcc --version | head -n 1
+          (java -version 2>&1 | head -n 1) || true
+
+      - name: Download and unpack LLVM ${{ env.LLVM_VERSION }}
+        run: |
+          set -euo pipefail
+          cd "$DSH_DL"
+          curl -fL --retry 3 --retry-delay 5 --retry-all-errors \
+            -o llvm-prebuilt.tar.xz \
+            "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/LLVM-${LLVM_VERSION}-Linux-X64.tar.xz"
+          ls -l llvm-prebuilt.tar.xz
+          # The release publishes no checksum file we can pin, so the archive is
+          # unpacked and the version is asserted from the binary itself below.
+          tar -xJf llvm-prebuilt.tar.xz -C "$DSH_BASE/llvm-pkg"
+          rm -f llvm-prebuilt.tar.xz
+          # The bin directory is located through a driver binary instead of the
+          # assumed top-level name (which may be versioned or a symlink).
+          bin="$(find "$DSH_BASE/llvm-pkg" -path '*/bin/*' \( -name clang -o -name 'clang-*' -o -name llvm-ar \) | head -n 1)"
+          if [ -z "$bin" ]; then echo '::error::no LLVM bin directory in the archive'; exit 1; fi
+          LLVM_BIN="$(dirname "$bin")"
+          # A versioned-only driver (clang-23 without clang) is patched up with
+          # unversioned links, because every script here calls `clang`/`clang++`.
+          if [ ! -e "$LLVM_BIN/clang" ]; then
+            ln -s "$(basename "$(find "$LLVM_BIN" -maxdepth 1 -name 'clang-2*' | head -n 1)")" "$LLVM_BIN/clang"
+          fi
+          if [ ! -e "$LLVM_BIN/clang++" ]; then
+            ln -s "$(basename "$(find "$LLVM_BIN" -maxdepth 1 -name 'clang++-2*' | head -n 1)")" "$LLVM_BIN/clang++"
+          fi
+          for tool in clang clang++ llvm-ar llvm-nm llvm-ranlib ld.lld; do
+            if [ ! -x "$LLVM_BIN/$tool" ]; then echo "::error::the LLVM package has no executable $tool"; exit 1; fi
+          done
+          echo "DSH_LLVM_BIN=$LLVM_BIN" >> "$GITHUB_ENV"
+          echo "llvm bin: $LLVM_BIN"
+          ls -l "$LLVM_BIN" | grep -E 'clang|llvm-ar|ld.lld' | head -n 10 || true
+          "$LLVM_BIN/clang" --version
+          dumped="$("$LLVM_BIN/clang" -dumpversion)"
+          echo "clang -dumpversion = $dumped"
+          if [ "$dumped" != "23.1.1" ]; then
+            echo "::error::clang -dumpversion is $dumped; runtime/ohos/node/build-runtimes.py requires exactly 23.1.1"
+            exit 1
+          fi
+
+      - name: Download and verify the pinned sources
+        run: |
+          set -euo pipefail
+          cd "$DSH_DL"
+          # LLVM source: consumed by build-runtimes.py --source-archive.
+          curl -fL --retry 3 --retry-delay 5 --retry-all-errors \
+            -o llvm-src.tar.xz \
+            "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/llvm-project-${LLVM_VERSION}.src.tar.xz"
+          echo "${LLVM_SOURCE_SHA256}  llvm-src.tar.xz" | sha256sum -c -
+          # Node source: consumed by build-node.py --source-archive and by
+          # build-hap-libs.py --node-source (which insists on a pristine tree).
+          curl -fL --retry 3 --retry-delay 5 --retry-all-errors \
+            -o node-src.tar.xz \
+            "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}.tar.xz"
+          echo "${NODE_SOURCE_SHA256}  node-src.tar.xz" | sha256sum -c -
+          tar -xJf node-src.tar.xz -C "$DSH_BASE/node-src" --strip-components=1
+          echo "DSH_NODE_SRC=$DSH_BASE/node-src" >> "$GITHUB_ENV"
+          grep -E '^#define NODE_(MAJOR|MINOR|PATCH)_VERSION' "$DSH_BASE/node-src/src/node_version.h"
+          test -f "$DSH_BASE/node-src/src/node_api.h"
+          ls -l llvm-src.tar.xz node-src.tar.xz
+
+      - name: Download the host Node ${{ env.NODE_VERSION }}
+        run: |
+          set -euo pipefail
+          cd "$DSH_DL"
+          curl -fL --retry 3 --retry-delay 5 --retry-all-errors \
+            -o node-host.tar.xz \
+            "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz"
+          echo "${NODE_HOST_SHA256}  node-host.tar.xz" | sha256sum -c -
+          tar -xJf node-host.tar.xz -C "$DSH_BASE/host-node" --strip-components=1
+          HOST_BIN="$DSH_BASE/host-node/bin"
+          echo "DSH_HOST_NODE=$HOST_BIN/node" >> "$GITHUB_ENV"
+          echo "$HOST_BIN" >> "$GITHUB_PATH"
+          # build-node.py asserts `node --version` == v24.22.1 exactly and
+          # check-arkts.sh runs hvigor with whatever `node` PATH resolves to.
+          version="$("$HOST_BIN/node" --version)"
+          echo "host node: $version"
+          if [ "$version" != "v${NODE_VERSION}" ]; then echo "::error::unexpected host node $version"; exit 1; fi
+          "$HOST_BIN/npm" --version
+
+      - name: Install npm ${{ env.NPM_VERSION }} for the composition recipe
+        run: |
+          set -euo pipefail
+          # runtime/ohos/package/composition.json pins installation.npmVersion to
+          # 11.9.0 and prepare-inputs.py compares `npm --version` exactly, while
+          # the Node 24.22.1 tarball bundles npm 11.19.1 -> install the pinned one.
+          npm install --global --prefix "$DSH_BASE/npm" "npm@${NPM_VERSION}"
+          DSH_NPM="$DSH_BASE/npm/bin/npm"
+          echo "DSH_NPM=$DSH_NPM" >> "$GITHUB_ENV"
+          got="$("$DSH_NPM" --version)"
+          echo "npm: $got"
+          if [ "$got" != "$NPM_VERSION" ]; then echo "::error::pinned npm did not install ($got)"; exit 1; fi
+
+      - name: Download the OpenHarmony SDK and expose its four Linux components
+        run: |
+          set -euo pipefail
+          cd "$DSH_DL"
+          curl -fL --retry 3 --retry-delay 10 --retry-all-errors -o ohos-sdk.tar.gz "$SDK_TAR_URL"
+          ls -l ohos-sdk.tar.gz
+          # The tarball is ~3.2 GB and holds one nested zip per component under
+          # ohos-sdk/linux/; only those members are extracted (host leftovers
+          # would cost several GB on the runner disk).
+          tar -tzf ohos-sdk.tar.gz > sdk-members.txt
+          grep -E '/linux/[^/]+\.zip$' sdk-members.txt > sdk-linux.txt || true
+          if [ ! -s sdk-linux.txt ]; then
+            echo '::error::the SDK tarball has no ohos-sdk/linux/*.zip members'
+            head -n 40 sdk-members.txt
+            exit 1
+          fi
+          cat sdk-linux.txt
+          mkdir -p "$DSH_BASE/sdk-raw"
+          tar -xzf ohos-sdk.tar.gz -C "$DSH_BASE/sdk-raw" -T sdk-linux.txt
+          while IFS= read -r zip; do
+            echo "unpacking $zip"
+            unzip -q -o "$zip" -d "$DSH_BASE/sdk-raw/extract"
+          done < <(find "$DSH_BASE/sdk-raw" -type f -name '*.zip')
+          rm -f ohos-sdk.tar.gz sdk-members.txt
+          # Locate each component by its oh-uni-package.json instead of guessing
+          # the directory names inside the zips.
+          SDK="$DSH_BASE/sdk"
+          mkdir -p "$SDK"
+          for part in ets js native toolchains; do
+            meta="$(find "$DSH_BASE/sdk-raw/extract" -type f -path "*/${part}/oh-uni-package.json" | head -n 1)"
+            if [ -z "$meta" ]; then
+              echo "::error::the Linux SDK components carry no $part/oh-uni-package.json"
+              find "$DSH_BASE/sdk-raw/extract" -maxdepth 3 -name oh-uni-package.json
+              exit 1
+            fi
+            ln -sfn "$(dirname "$meta")" "$SDK/$part"
+            echo "$part -> $(dirname "$meta")"
+            python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print('  apiVersion=%s version=%s' % (d.get('apiVersion'), d.get('version')))" "$SDK/$part/oh-uni-package.json"
+          done
+          for f in native/llvm/bin/clang native/llvm/bin/clang++ native/llvm/bin/ld.lld \
+                   native/llvm/bin/llvm-ar native/llvm/bin/llvm-nm native/llvm/bin/llvm-ranlib \
+                   native/llvm/bin/llvm-readelf native/llvm/bin/llvm-strip \
+                   native/sysroot/usr/include/stdio.h native/sysroot/usr/include/deviceinfo.h \
+                   native/sysroot/usr/lib/aarch64-linux-ohos/libc.so \
+                   native/build/cmake/ohos.toolchain.cmake \
+                   native/llvm/lib/aarch64-linux-ohos toolchains/ark_disasm; do
+            if [ ! -e "$SDK/$f" ]; then
+              echo "::error::the SDK is missing $f"
+              exit 1
+            fi
+          done
+          # Needed by the audit step in build-hap-libs.py when a library links
+          # against it; only warn, since it is not a prerequisite of any script.
+          if [ ! -e "$SDK/native/sysroot/usr/lib/aarch64-linux-ohos/libace_napi.z.so" ]; then
+            echo "::warning::the SDK sysroot has no libace_napi.z.so; the native audit may fail to resolve NEEDED entries"
+          fi
+          api="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['apiVersion'])" "$SDK/ets/oh-uni-package.json")"
+          echo "ets apiVersion=$api (check-arkts.sh requires 26)"
+          if [ "$api" != "26" ]; then echo "::error::SDK apiVersion is $api but check-arkts.sh is pinned to 26"; exit 1; fi
+          {
+            echo "DSH_SDK=$SDK"
+            echo "DSH_SDK_NATIVE=$SDK/native"
+          } >> "$GITHUB_ENV"
+
+      - name: Install the Node build tools (esbuild)
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefix runtime/ohos/node/build-tools
+
+      - name: Build libc++ / libc++abi / libunwind for aarch64-linux-ohos
+        run: |
+          set -euo pipefail
+          python3 runtime/ohos/node/build-runtimes.py \
+            --sdk-native "$DSH_SDK_NATIVE" \
+            --clang "$DSH_LLVM_BIN/clang" \
+            --source-archive "$DSH_DL/llvm-src.tar.xz" \
+            --work "$DSH_BASE/work-runtimes" \
+            --output "$DSH_BASE/runtimes" \
+            --jobs "$DSH_JOBS"
+          ls -l "$DSH_BASE/runtimes" "$DSH_BASE/runtimes/lib"
+
+      - name: Cross-compile libnode.so
+        run: |
+          set -euo pipefail
+          python3 runtime/ohos/node/build-node.py \
+            --sdk-native "$DSH_SDK_NATIVE" \
+            --clang "$DSH_LLVM_BIN/clang" \
+            --cxx-runtime "$DSH_BASE/runtimes" \
+            --source-archive "$DSH_DL/node-src.tar.xz" \
+            --host-node "$DSH_HOST_NODE" \
+            --work "$DSH_BASE/work-node" \
+            --output "$DSH_BASE/libnode" \
+            --jobs "$DSH_JOBS"
+          ls -l "$DSH_BASE/libnode"
+
+      - name: Download the third-party native inputs
+        run: |
+          set -euo pipefail
+          fetch() {
+            curl -fL --retry 3 --retry-delay 5 --retry-all-errors -o "$2" "$1"
+            echo "$3  $2" | sha256sum -c -
+          }
+          cd "$DSH_DL"
+          # @deepseek-ai/node-addon-system 0.1.2 -> build-flock.py pins its
+          # src/flock.c; node-addon-api 8.9.2 -> source-pins.json pins 5 files.
+          fetch "https://registry.npmjs.org/@deepseek-ai/node-addon-system/-/node-addon-system-0.1.2.tgz" flock.tgz "${FLOCK_TGZ_SHA256}"
+          fetch "https://registry.npmjs.org/node-addon-api/-/node-addon-api-8.9.2.tgz" node-addon-api.tgz "${NODE_ADDON_API_TGZ_SHA256}"
+          # Loader source: runtime/ohos/native/loader/source-pins.json archiveURL.
+          fetch "https://codeload.github.com/deepseek-ai/dsh-node-addon-require-builtin/tar.gz/a58d3599a2e551d7d706d1ff796c9fd4bbaff63c" loader.tar.gz "${LOADER_TAR_SHA256}"
+          # sqlite: build-sqlite.py verifies the amalgamation zip and requires the
+          # Dart sqlite3 package version that app/pubspec.lock pins (3.9.1).
+          fetch "https://www.sqlite.org/2026/sqlite-amalgamation-3540100.zip" sqlite-amalgamation-3540100.zip "${SQLITE_ZIP_SHA256}"
+          fetch "https://pub.dev/api/archives/sqlite3-3.9.1.tar.gz" sqlite3-3.9.1.tar.gz "${SQLITE3_PKG_SHA256}"
+          mkdir -p "$DSH_BASE/third/flock" "$DSH_BASE/third/node-addon-api" \
+                   "$DSH_BASE/third/loader" "$DSH_BASE/third/sqlite3"
+          tar -xzf flock.tgz -C "$DSH_BASE/third/flock" --strip-components=1
+          tar -xzf node-addon-api.tgz -C "$DSH_BASE/third/node-addon-api" --strip-components=1
+          tar -xzf loader.tar.gz -C "$DSH_BASE/third/loader" --strip-components=1
+          tar -xzf sqlite3-3.9.1.tar.gz -C "$DSH_BASE/third/sqlite3"
+          test -f "$DSH_BASE/third/flock/src/flock.c"
+          test -f "$DSH_BASE/third/loader/packages/native/src/node_api_addon.cc"
+          test -f "$DSH_BASE/third/node-addon-api/napi.h"
+          test -f "$DSH_BASE/third/sqlite3/pubspec.yaml"
+          grep -E '^name:|^version:' "$DSH_BASE/third/sqlite3/pubspec.yaml"
+
+      - name: Build the HAP native libraries and audit them
+        run: |
+          set -euo pipefail
+          # --clang must be the clang++ the cxx runtime was built with; the flock
+          # addon is compiled with the SDK's own clang by build-hap-libs.py.
+          python3 runtime/ohos/native/build-hap-libs.py \
+            --sdk-native "$DSH_SDK_NATIVE" \
+            --clang "$DSH_LLVM_BIN/clang++" \
+            --cxx-runtime "$DSH_BASE/runtimes" \
+            --libnode-output "$DSH_BASE/libnode" \
+            --node-source "$DSH_NODE_SRC" \
+            --flock-package "$DSH_BASE/third/flock" \
+            --loader-source "$DSH_BASE/third/loader" \
+            --node-addon-api "$DSH_BASE/third/node-addon-api" \
+            --sqlite-amalgamation "$DSH_DL/sqlite-amalgamation-3540100.zip" \
+            --sqlite3-package "$DSH_BASE/third/sqlite3" \
+            --work "$DSH_BASE/work-hap-libs" \
+            --output "$DSH_BASE/native/arm64-v8a"
+          ls -l "$DSH_BASE/native/arm64-v8a"
+          cat "$DSH_BASE/native/audit.json"
+          echo "DSH_NATIVE=$DSH_BASE/native/arm64-v8a" >> "$GITHUB_ENV"
+
+      - name: Keep the native libraries even if the packaging steps fail
+        if: always()
+        run: |
+          set -uo pipefail
+          mkdir -p keep/native keep/libnode keep/runtimes
+          base="${DSH_BASE:-/nonexistent}"
+          [ -d "$base/native" ] && cp -a "$base/native/." keep/native/ || true
+          [ -d "$base/libnode" ] && cp -a "$base/libnode/." keep/libnode/ || true
+          [ -d "$base/runtimes" ] && cp -a "$base/runtimes/." keep/runtimes/ || true
+          ls -lR keep | head -n 40
+
+      - name: Upload the native libraries
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dsh-ohos-native
+          path: |
+            keep/native
+            keep/libnode
+            keep/runtimes
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Download the newest successful ohos-aot artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+          run_id="$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
+            "$api/actions/workflows/ohos-compile.yml/runs?status=success&per_page=1" \
+            | jq -r '.workflow_runs[0].id // empty')"
+          if [ -z "$run_id" ]; then echo '::error::ohos-compile.yml has no successful run in this repository'; exit 1; fi
+          echo "newest successful ohos-compile run: $run_id"
+          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
+            "$api/actions/runs/$run_id/artifacts" > "$DSH_DL/aot-artifacts.json"
+          artifact_id="$(jq -r '[.artifacts[] | select(.expired == false) | select(.name | startswith("ohos-aot-"))] | sort_by(.created_at) | last | .id // empty' "$DSH_DL/aot-artifacts.json")"
+          artifact_name="$(jq -r '[.artifacts[] | select(.expired == false) | select(.name | startswith("ohos-aot-"))] | sort_by(.created_at) | last | .name // empty' "$DSH_DL/aot-artifacts.json")"
+          if [ -z "$artifact_id" ]; then echo '::error::that run has no unexpired ohos-aot-* artifact'; exit 1; fi
+          echo "artifact: $artifact_name (id $artifact_id)"
+          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
+            -o "$DSH_DL/aot.zip" "$api/actions/artifacts/$artifact_id/zip"
+          unzip -q -o "$DSH_DL/aot.zip" -d "$DSH_BASE/aot"
+          test -f "$DSH_BASE/aot/arm64-v8a/app.so"
+          test -f "$DSH_BASE/aot/flutter_assets/AssetManifest.bin"
+          ls -l "$DSH_BASE/aot" "$DSH_BASE/aot/arm64-v8a"
+          echo "DSH_AOT=$DSH_BASE/aot" >> "$GITHUB_ENV"
+
+      - name: Prepare the runtime inputs and the re2js regex artifact
+        run: |
+          set -euo pipefail
+          # prepare-inputs.py pins npm 11.9.0 / node 24.22.1 and refuses --out
+          # inside the repository.
+          python3 runtime/ohos/package/prepare-inputs.py \
+            --target ohos \
+            --node "$DSH_HOST_NODE" \
+            --npm "$DSH_NPM" \
+            --cache "$DSH_BASE/npm-cache" \
+            --out "$DSH_BASE/prepared"
+          # compose-runtime.py and build-rg-regex.mjs resolve their packages
+          # through these two links; this mirrors tooling/ohos/run-gates.py
+          # (prepared-inputs gate), which creates them before composing.
+          for link in node_modules runtime/ohos/process/node_modules; do
+            if [ -e "$link" ] || [ -L "$link" ]; then
+              echo "::error::$link already exists, refusing to replace it"
+              exit 1
+            fi
+          done
+          ln -s "$DSH_BASE/prepared/dsh/node_modules" node_modules
+          ln -s "$DSH_BASE/prepared/process/node_modules" runtime/ohos/process/node_modules
+          node runtime/ohos/process/build-rg-regex.mjs runtime/ohos/node/build-tools
+          sha256sum runtime/ohos/process/build/re2js-unicode.mjs
+
+      - name: Compose the dsh-runtime rawfile archive
+        run: |
+          set -euo pipefail
+          python3 runtime/ohos/package/compose-runtime.py \
+            --target ohos \
+            --dsh-prefix "$DSH_BASE/prepared/dsh" \
+            --process-prefix "$DSH_BASE/prepared/process" \
+            --target-report "$DSH_BASE/prepared/target-report.json" \
+            --prepared-inputs "$DSH_BASE/prepared/prepared-inputs.json" \
+            --regex-artifact runtime/ohos/process/build/re2js-unicode.mjs \
+            --esbuild-prefix runtime/ohos/node/build-tools \
+            --imports-report "$DSH_BASE/composition/composition-imports.json" \
+            --out "$DSH_BASE/composition/composed" \
+            --node "$DSH_HOST_NODE" \
+            --runtime-core app/ohos/entry/src/main/ets/runtime/RuntimeCore.ets
+          ls -l "$DSH_BASE/composition/composed"
+
+      - name: Set the bundleName of the HAP
+        run: |
+          set -euo pipefail
+          # app/ohos/AppScope/app.json5 is the only place the bundleName lives;
+          # check-arkts.sh copies app/ohos into a scratch tree, so the override has
+          # to happen in the checked-out tree before it runs.
+          bundle="${{ inputs.bundleName }}"
+          if ! printf '%s' "$bundle" | grep -Eq '^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$'; then
+            echo "::error::bundleName '$bundle' is not a dotted identifier"
+            exit 1
+          fi
+          file=app/ohos/AppScope/app.json5
+          echo "--- before ---"
+          grep -n 'bundleName' "$file"
+          sed -i -E "s|(\"bundleName\"[[:space:]]*:[[:space:]]*)\"[^\"]*\"|\1\"${bundle}\"|" "$file"
+          echo "--- after ---"
+          grep -n 'bundleName' "$file"
+          grep -q "\"bundleName\": \"${bundle}\"" "$file"
+
+      - name: Compile ArkTS and package the unsigned HAP
+        run: |
+          set -euo pipefail
+          chmod +x tooling/ohos/check-arkts.sh
+          tooling/ohos/check-arkts.sh \
+            --sdk "$DSH_SDK" \
+            --work "$DSH_BASE/arkts" \
+            --source app/ohos \
+            --full \
+            --hms-stubs \
+            --aot "$DSH_AOT" \
+            --native "$DSH_NATIVE" \
+            --runtime "$DSH_BASE/composition/composed/dsh-runtime-rawfile.zip" \
+            --node-headers "$DSH_NODE_SRC/src"
+
+      - name: Show the build log tail on failure
+        if: failure()
+        run: |
+          for f in "$DSH_BASE/arkts/hvigor.log" "$DSH_BASE/arkts/diagnostics.txt"; do
+            if [ -f "$f" ]; then echo "===== $f ====="; tail -n 80 "$f"; fi
+          done
+
+      - name: Collect the deliverables
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p dist/libs dist/hap dist/audit dist/logs
+          if compgen -G "$DSH_BASE/native/arm64-v8a/*.so" > /dev/null; then
+            cp "$DSH_BASE"/native/arm64-v8a/*.so dist/libs/
+          fi
+          if [ -f "$DSH_BASE/native/audit.json" ]; then
+            cp "$DSH_BASE/native/audit.json" dist/audit/native-audit.json
+          fi
+          if [ -f "$DSH_BASE/composition/composed/composition-report.json" ]; then
+            cp "$DSH_BASE/composition/composed/composition-report.json" dist/audit/composition-report.json
+          fi
+          if [ -f "$DSH_BASE/composition/composition-imports.json" ]; then
+            cp "$DSH_BASE/composition/composition-imports.json" dist/audit/composition-imports.json
+          fi
+          for f in diagnostics.txt hvigor.log build-identity.json hap-audit.json \
+                   diagnostic-source-paths.json hms-stubs.json; do
+            if [ -f "$DSH_BASE/arkts/$f" ]; then cp "$DSH_BASE/arkts/$f" "dist/logs/$f"; fi
+          done
+          # check-arkts.sh builds inside mktemp under --work, so the HAP is not
+          # copied out by the script itself: find it instead of assuming a path.
+          hap="$(find "$DSH_BASE/arkts" -type f -name 'entry-default-unsigned.hap' -print -quit || true)"
+          if [ -n "${hap:-}" ]; then
+            cp "$hap" dist/hap/dsh-go-unsigned.hap
+            echo "hap: $hap"
+          fi
+          ls -lR dist
+
+      - name: Upload the native libraries, the unsigned HAP and the audits
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ohos-native-and-hap
+          path: |
+            dist/libs
+            dist/hap
+            dist/audit
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload the build logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ohos-build-logs
+          path: dist/logs
+          if-no-files-found: warn
+          retention-days: 7
